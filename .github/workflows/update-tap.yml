@@ -1,0 +1,101 @@
+name: Update Tap
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Run daily at midnight
+  workflow_dispatch:      # Allow manual trigger
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v3
+
+      - name: Get latest release info
+        id: latest
+        run: |
+          RELEASE_JSON=$(curl -sL https://api.github.com/repos/vincentzhangz/singleshot/releases/latest)
+          TAG_NAME=$(echo "$RELEASE_JSON" | jq -r .tag_name)
+          # Strip 'v' if present for version comparison, assuming standard semver
+          VERSION=${TAG_NAME#v}
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check current version
+        id: current
+        run: |
+          # Extract version from Formula file
+          CURRENT_VERSION=$(grep 'version "' Formula/singleshot.rb | cut -d'"' -f2)
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update Formula
+        if: steps.latest.outputs.version != steps.current.outputs.current_version
+        run: |
+          TAG=${{ steps.latest.outputs.tag_name }}
+          VERSION=${{ steps.latest.outputs.version }}
+          
+          # Fetch assets to get SHAs
+          # Note: This simple approach fetches the SHA from the files yourself if a checksum file isn't provided.
+          # Ideally, one would trust the release or calculate it. Here we download to calc SHA.
+          
+          ARM_URL="https://github.com/vincentzhangz/singleshot/releases/download/$TAG/singleshot-aarch64-apple-darwin.tar.gz"
+          INTEL_URL="https://github.com/vincentzhangz/singleshot/releases/download/$TAG/singleshot-x86_64-apple-darwin.tar.gz"
+          LINUX_URL="https://github.com/vincentzhangz/singleshot/releases/download/$TAG/singleshot-x86_64-unknown-linux-gnu.tar.gz"
+          
+          curl -L -o singleshot-arm.tar.gz "$ARM_URL"
+          curl -L -o singleshot-intel.tar.gz "$INTEL_URL"
+          curl -L -o singleshot-linux.tar.gz "$LINUX_URL"
+          
+          ARM_SHA=$(sha256sum singleshot-arm.tar.gz | cut -d ' ' -f 1)
+          INTEL_SHA=$(sha256sum singleshot-intel.tar.gz | cut -d ' ' -f 1)
+          LINUX_SHA=$(sha256sum singleshot-linux.tar.gz | cut -d ' ' -f 1)
+          
+          echo "Updating to version $VERSION"
+          echo "Arm SHA: $ARM_SHA"
+          echo "Intel SHA: $INTEL_SHA"
+          echo "Linux SHA: $LINUX_SHA"
+          
+          # Regenerate the formula content
+          cat > Formula/singleshot.rb <<EOF
+class Singleshot < Formula
+  desc "One-click screenshot tool"
+  homepage "https://github.com/vincentzhangz/singleshot"
+  version "$VERSION"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "$ARM_URL"
+      sha256 "$ARM_SHA"
+    else
+      url "$INTEL_URL"
+      sha256 "$INTEL_SHA"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.intel?
+      url "$LINUX_URL"
+      sha256 "$LINUX_SHA"
+    end
+  end
+
+  def install
+    bin.install "singleshot"
+  end
+
+  test do
+    system "#{bin}/singleshot", "--version"
+  end
+end
+EOF
+
+
+      - name: Commit and Push
+        if: steps.latest.outputs.version != steps.current.outputs.current_version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/singleshot.rb
+          git commit -m "Update singleshot to ${{ steps.latest.outputs.version }}"
+          git push origin main
